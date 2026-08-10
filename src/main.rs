@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fs::read_dir;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -7,18 +8,18 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, List, ListState};
 use ratatui::{Frame, Terminal};
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 fn main() -> std::io::Result<()> {
+    let start_dir = std::env::current_dir()?;
+
     let mut terminal = enter_tui()?;
-    let entries = list_dir(Path::new("."))?;
-
-    let result = run(&mut terminal, &entries);
-
+    let result = run(&mut terminal, start_dir);
     leave_tui()?;
+
     result
 }
 
@@ -43,23 +44,95 @@ fn leave_tui() -> std::io::Result<()> {
     disable_raw_mode()
 }
 
-fn run(terminal: &mut Tui, entries: &[String]) -> std::io::Result<()> {
+fn run(terminal: &mut Tui, start_dir: PathBuf) -> std::io::Result<()> {
+    let mut current_dir = start_dir;
+    let mut entries = list_dir(&current_dir)?;
+
+    // Por ahora almacenemos un HashMap con el path y el último indice,
+    // de este modo al subir o bajar en el árbol preservamos la posición
+    // del cursor al regresar.
+    // Eventualmente almacenaremos más información del directorio.
+    let mut positions: HashMap<PathBuf, usize> = HashMap::new();
+
+    let mut state = ListState::default();
+    state.select(Some(0));
+
     loop {
-        terminal.draw(|frame| draw(frame, entries))?;
+        terminal.draw(|frame| draw(frame, &current_dir, &entries, &mut state))?;
 
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if key.code == KeyCode::Char('q') {
-                return Ok(());
+            match key.code {
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char('j') | KeyCode::Down => state.select_next(),
+                KeyCode::Char('k') | KeyCode::Up => state.select_previous(),
+                KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                    descend(&mut current_dir, &mut entries, &mut positions, &mut state)?;
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    ascend(&mut current_dir, &mut entries, &mut positions, &mut state)?;
+                }
+                _ => {}
             }
         }
     }
 }
 
-fn draw(frame: &mut Frame, entries: &[String]) {
-    let block = Block::bordered().title("fm");
-    let listing = Paragraph::new(entries.join("\n")).block(block);
-    frame.render_widget(listing, frame.area());
+fn descend(
+    current_dir: &mut PathBuf,
+    entries: &mut Vec<String>,
+    positions: &mut HashMap<PathBuf, usize>,
+    state: &mut ListState,
+) -> std::io::Result<()> {
+    let index = match state.selected() {
+        Some(index) => index,
+        None => return Ok(()),
+    };
+    let name = match entries.get(index) {
+        Some(name) => name,
+        None => return Ok(()),
+    };
+
+    let target = current_dir.join(name);
+    if !target.is_dir() {
+        return Ok(());
+    }
+
+    positions.insert(current_dir.clone(), index);
+    *entries = list_dir(&target)?;
+    *current_dir = target;
+
+    let restored = positions.get(current_dir.as_path()).copied().unwrap_or(0);
+    state.select(Some(restored));
+    Ok(())
+}
+
+fn ascend(
+    current_dir: &mut PathBuf,
+    entries: &mut Vec<String>,
+    positions: &mut HashMap<PathBuf, usize>,
+    state: &mut ListState,
+) -> std::io::Result<()> {
+    let parent = match current_dir.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => return Ok(()),
+    };
+    positions.insert(current_dir.clone(), state.selected().unwrap_or(0));
+    *entries = list_dir(&parent)?;
+    *current_dir = parent;
+
+    let restored = positions.get(current_dir.as_path()).copied().unwrap_or(0);
+    state.select(Some(restored));
+
+    Ok(())
+}
+
+fn draw(frame: &mut Frame, current_dir: &Path, entries: &[String], state: &mut ListState) {
+    let block = Block::bordered().title(format!(" {} ", current_dir.display()));
+    let list = List::new(entries.iter().map(String::as_str))
+        .block(block)
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, frame.area(), state);
 }
